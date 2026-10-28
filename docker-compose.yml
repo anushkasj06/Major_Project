@@ -1,0 +1,272 @@
+version: "3.9"
+
+services:
+  # ─────────────────────────────────────────────
+  # INFRASTRUCTURE
+  # ─────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: arambh_mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-arambh_secret}
+      MONGO_INITDB_DATABASE: arambh
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./devops/docker/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - arambh_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: arambh_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - arambh_net
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: arambh_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - arambh_net
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # BACKEND API
+  # ─────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: arambh_backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - MONGODB_URL=mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-arambh_secret}@mongodb:27017/arambh?authSource=admin
+      - REDIS_URL=redis://redis:6379
+      - QDRANT_URL=http://qdrant:6333
+      - AI_SERVICE_URL=http://ai-services:8001
+      - CRAWLER_SERVICE_URL=http://crawler:8002
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - arambh_net
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ─────────────────────────────────────────────
+  # AI SERVICES (RAG + Agents)
+  # ─────────────────────────────────────────────
+  ai-services:
+    build:
+      context: ./ai-services
+      dockerfile: Dockerfile
+    container_name: arambh_ai
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - MONGODB_URL=mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-arambh_secret}@mongodb:27017/arambh?authSource=admin
+      - REDIS_URL=redis://redis:6379
+      - QDRANT_URL=http://qdrant:6333
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./ai-services:/app
+      - uploads_data:/app/uploads
+      - model_cache:/root/.cache/huggingface
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - arambh_net
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  # ─────────────────────────────────────────────
+  # CRAWLER SERVICE
+  # ─────────────────────────────────────────────
+  crawler:
+    build:
+      context: ./crawler
+      dockerfile: Dockerfile
+    container_name: arambh_crawler
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - MONGODB_URL=mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-arambh_secret}@mongodb:27017/arambh?authSource=admin
+      - REDIS_URL=redis://redis:6379
+      - AI_SERVICE_URL=http://ai-services:8001
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./crawler:/app
+      - uploads_data:/app/uploads
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - arambh_net
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
+
+  # ─────────────────────────────────────────────
+  # CELERY WORKERS
+  # ─────────────────────────────────────────────
+  celery-worker:
+    build:
+      context: ./crawler
+      dockerfile: Dockerfile
+    container_name: arambh_celery
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - MONGODB_URL=mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-arambh_secret}@mongodb:27017/arambh?authSource=admin
+      - REDIS_URL=redis://redis:6379
+      - AI_SERVICE_URL=http://ai-services:8001
+    volumes:
+      - ./crawler:/app
+      - uploads_data:/app/uploads
+    depends_on:
+      - redis
+      - mongodb
+    networks:
+      - arambh_net
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+
+  celery-beat:
+    build:
+      context: ./crawler
+      dockerfile: Dockerfile
+    container_name: arambh_celery_beat
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - MONGODB_URL=mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-arambh_secret}@mongodb:27017/arambh?authSource=admin
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./crawler:/app
+    depends_on:
+      - redis
+      - celery-worker
+    networks:
+      - arambh_net
+    command: celery -A app.celery_app beat --loglevel=info
+
+  # ─────────────────────────────────────────────
+  # FRONTEND
+  # ─────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: arambh_frontend
+    restart: unless-stopped
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_WS_URL=ws://localhost:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - arambh_net
+
+  # ─────────────────────────────────────────────
+  # NGINX REVERSE PROXY
+  # ─────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: arambh_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./devops/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - arambh_net
+
+  # ─────────────────────────────────────────────
+  # MONITORING
+  # ─────────────────────────────────────────────
+  mongo-express:
+    image: mongo-express:latest
+    container_name: arambh_mongo_express
+    restart: unless-stopped
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_ROOT_USER:-admin}
+      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_ROOT_PASSWORD:-arambh_secret}
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-arambh_secret}@mongodb:27017/
+      ME_CONFIG_BASICAUTH: false
+    ports:
+      - "8081:8081"
+    depends_on:
+      - mongodb
+    networks:
+      - arambh_net
+    profiles:
+      - monitoring
+
+volumes:
+  mongodb_data:
+  qdrant_data:
+  redis_data:
+  uploads_data:
+  model_cache:
+
+networks:
+  arambh_net:
+    driver: bridge

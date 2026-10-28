@@ -1,0 +1,46 @@
+version: "3.9"
+
+# Run with: docker compose -f docker-compose.yml -f devops/monitoring/docker-compose.monitoring.yml up
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: arambh_prometheus
+    volumes:
+      - ./devops/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - arambh_net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: arambh_grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: false
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - arambh_net
+
+  mongo-express:
+    image: mongo-express:latest
+    container_name: arambh_mongo_express
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_ROOT_USER:-admin}
+      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_ROOT_PASSWORD:-arambh_secret}
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-arambh_secret}@mongodb:27017/
+      ME_CONFIG_BASICAUTH: false
+    ports:
+      - "8081:8081"
+    networks:
+      - arambh_net
+
+volumes:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'arambh-backend'
+    static_configs:
+      - targets: ['backend:8000']
+    metrics_path: /api/metrics
+
+  - job_name: 'arambh-ai-services'
+    static_configs:
+      - targets: ['ai-services:8001']
+    metrics_path: /metrics
+
+  - job_name: 'arambh-crawler'
+    static_configs:
+      - targets: ['crawler:8002']
+    metrics_path: /metrics
